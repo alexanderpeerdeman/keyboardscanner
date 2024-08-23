@@ -16,13 +16,13 @@ use arduino_hal::{
 use panic_halt as _;
 
 const PRESCALER: u32 = 64;
-const TIMER_COUNTS: u32 = 125;
-const MILLIS_INCREMENT: u32 = PRESCALER + TIMER_COUNTS / 16000;
+const TIMER_COUNTS: u32 = 250;
+const MILLIS_INCREMENT: u32 = PRESCALER * TIMER_COUNTS / 16000;
 static MILLIS_COUNTER: avr_device::interrupt::Mutex<cell::Cell<u32>> =
     avr_device::interrupt::Mutex::new(cell::Cell::new(0));
 
-const MIN_TIME_MS: u32 = 128;
-const MAX_TIME_MS: u32 = 4096;
+const MIN_TIME_MS: u32 = 3;
+const MAX_TIME_MS: u32 = 50;
 const MAX_TIME_MS_N: u32 = MAX_TIME_MS - MIN_TIME_MS;
 
 #[derive(Copy, Clone)]
@@ -125,10 +125,11 @@ impl Key {
             KeyState::Released => {
                 if sensor3 {
                     self.state = KeyState::On;
-                    let velocity = calc_velocity(millis() - self.time);
-                    if velocity > 60 {
-                        send_midi(serial, MidiEvent::On, self.index, velocity);
+                    let time_since_on = millis() - self.time;
+                    if time_since_on < 50 {
+                        return;
                     }
+                    send_midi(serial, MidiEvent::On, self.index, calc_velocity(time_since_on));
                 }
                 if !sensor2 {
                     self.state = KeyState::Sustain;
