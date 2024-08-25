@@ -1,3 +1,5 @@
+// https://crates.io/crates/usbd-midi
+
 #![no_std]
 #![no_main]
 #![feature(abi_avr_interrupt)]
@@ -87,6 +89,9 @@ impl Key {
 
         kc[self.kc].set_low();
         let sensor2 = fi[self.fi].is_low();
+        kc[self.kc].set_high();
+
+        kc[self.kc].set_low();
         let sensor3 = si[self.si].is_low();
         kc[self.kc].set_high();
 
@@ -94,15 +99,20 @@ impl Key {
             KeyState::Off => {
                 if sensor1 {
                     self.state = KeyState::Start;
+                    return;
                 }
             }
             KeyState::Start => {
                 if sensor2 {
                     self.state = KeyState::Detected;
                     self.time = millis();
+                    return;
                 }
                 if !sensor1 {
                     self.state = KeyState::Off;
+                    let velocity = calc_velocity(millis() - self.time);
+                    send_midi(serial, MidiEvent::Off, self.index, velocity);
+                    return;
                 }
             }
             KeyState::Detected => {
@@ -110,41 +120,38 @@ impl Key {
                     self.state = KeyState::On;
                     let velocity = calc_velocity(millis() - self.time);
                     send_midi(serial, MidiEvent::On, self.index, velocity);
+                    return;
                 }
                 if !sensor2 {
                     self.state = KeyState::Start;
                     self.time = millis();
+                    return;
                 }
             }
             KeyState::On => {
                 if !sensor3 {
                     self.state = KeyState::Released;
-                    self.time = millis();
+                    return;
                 }
             }
             KeyState::Released => {
-                if sensor3 {
-                    self.state = KeyState::On;
-                    let time_since_on = millis() - self.time;
-                    if time_since_on < 50 {
-                        return;
-                    }
-                    send_midi(serial, MidiEvent::On, self.index, calc_velocity(time_since_on));
-                }
                 if !sensor2 {
                     self.state = KeyState::Sustain;
                     self.time = millis();
+                    return;
                 }
             }
             KeyState::Sustain => {
                 if sensor2 {
                     self.state = KeyState::Detected;
                     self.time = millis();
+                    return;
                 }
                 if !sensor1 {
                     self.state = KeyState::Off;
                     let velocity = calc_velocity(millis() - self.time);
                     send_midi(serial, MidiEvent::Off, self.index, velocity);
+                    return;
                 }
             }
         };
@@ -362,6 +369,7 @@ fn main() -> ! {
         }
     }
 }
+
 type Console = arduino_hal::hal::usart::Usart0<arduino_hal::DefaultClock>;
 
 fn calc_velocity(time: u32) -> u8 {
