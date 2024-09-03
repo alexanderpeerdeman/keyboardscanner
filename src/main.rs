@@ -4,16 +4,15 @@
 #![no_main]
 #![feature(abi_avr_interrupt)]
 
-const DEBUG: bool = false;
-
 use core::cell;
 
 use arduino_hal::{
-    hal::port::Dynamic,
+    hal::port::{Dynamic, PF0},
     port::{
-        mode::{Input, Output, PullUp},
+        mode::{Analog, Input, Output, PullUp},
         Pin,
     },
+    Adc,
 };
 use panic_halt as _;
 
@@ -23,9 +22,11 @@ const MILLIS_INCREMENT: u32 = PRESCALER * TIMER_COUNTS / 16000;
 static MILLIS_COUNTER: avr_device::interrupt::Mutex<cell::Cell<u32>> =
     avr_device::interrupt::Mutex::new(cell::Cell::new(0));
 
-const MIN_TIME_MS: u32 = 3;
-const MAX_TIME_MS: u32 = 50;
-const MAX_TIME_MS_N: u32 = MAX_TIME_MS - MIN_TIME_MS;
+const KEY_MIN_TIME_MS: u32 = 3;
+const KEY_MAX_TIME_MS: u32 = 50;
+const KEY_MAX_TIME_MS_N: u32 = KEY_MAX_TIME_MS - KEY_MIN_TIME_MS;
+
+const PITCH_BEND_MAX: u16 = 960;
 
 #[derive(Copy, Clone)]
 enum KeyState {
@@ -35,6 +36,63 @@ enum KeyState {
     On,
     Released,
     Sustain,
+}
+
+enum PedalType {
+    Damper,
+    SoftSostenuto,
+}
+
+struct Pedal {
+    kind: PedalType,
+    pressed: bool,
+}
+
+impl Pedal {
+    fn new(kind: PedalType) -> Self {
+        Self {
+            kind,
+            pressed: false,
+        }
+    }
+
+    fn read(&mut self, serial: &mut Console, input: &Pin<Input<PullUp>, Dynamic>) {
+        let pressed = input.is_low();
+        if self.pressed != pressed {
+            self.pressed = pressed;
+            let midi_value_1 = match self.kind {
+                PedalType::Damper => 64,
+                PedalType::SoftSostenuto => 67,
+            };
+            let midi_value_2 = match self.pressed {
+                true => 127,
+                false => 0,
+            };
+            send_midi(serial, MidiEvent::CC, midi_value_1, midi_value_2);
+        }
+    }
+}
+
+struct Wheel {
+    bend: u16,
+}
+
+impl Wheel {
+    fn new() -> Self {
+        Wheel { bend: 64 }
+    }
+
+    fn read(&mut self, serial: &mut Console, pitchbend: &Pin<Analog, PF0>, adc: &mut Adc) {
+        let voltage = pitchbend.analog_read(adc);
+
+        let clamped = clamp(voltage, 0, PITCH_BEND_MAX);
+        let mapped = map_range(clamped, 0, PITCH_BEND_MAX, 0, 127);
+
+        if mapped != self.bend {
+            self.bend = mapped;
+            send_midi(serial, MidiEvent::PitchBend, 0, mapped as u8);
+        }
+    }
 }
 
 struct Key {
@@ -161,6 +219,8 @@ impl Key {
 enum MidiEvent {
     On,
     Off,
+    PitchBend,
+    CC,
 }
 
 #[avr_device::interrupt(atmega2560)]
@@ -197,6 +257,7 @@ fn millis() -> u32 {
 #[arduino_hal::entry]
 fn main() -> ! {
     let dp = arduino_hal::Peripherals::take().unwrap();
+    let mut adc = arduino_hal::Adc::new(dp.ADC, Default::default());
     let pins = arduino_hal::pins!(dp);
     let mut serial = arduino_hal::default_serial!(dp, pins, 115200);
 
@@ -242,8 +303,8 @@ fn main() -> ! {
 
     // 20 pin connector
     let ki10 = pins.d20.into_pull_up_input().downgrade();
-    let ki9 = pins.d19.into_pull_up_input().downgrade();
-    let ki8 = pins.d18.into_pull_up_input().downgrade();
+    let ki9 = pins.d22.into_pull_up_input().downgrade();
+    let ki8 = pins.d23.into_pull_up_input().downgrade();
     let ki7 = pins.d17.into_pull_up_input().downgrade();
     let ki6 = pins.d16.into_pull_up_input().downgrade();
     let ki5 = pins.d15.into_pull_up_input().downgrade();
@@ -356,6 +417,14 @@ fn main() -> ! {
         Key::new(108, 7, 7, 10, 10, 10, "C8"), //C8
     ];
 
+    let mut wheel = Wheel::new();
+    let mut pedal_damp = Pedal::new(PedalType::Damper);
+    let mut pedal_softsostenuto = Pedal::new(PedalType::SoftSostenuto);
+
+    let pitchbend = pins.a0.into_analog_input(&mut adc);
+    let pin_damp = pins.a1.into_pull_up_input().downgrade();
+    let pin_sofsos = pins.a2.into_pull_up_input().downgrade();
+
     loop {
         for key in keys.iter_mut() {
             key.read(
@@ -367,7 +436,30 @@ fn main() -> ! {
                 &ki_pins,
             );
         }
+
+        wheel.read(&mut serial, &pitchbend, &mut adc);
+
+        pedal_damp.read(&mut serial, &pin_damp);
+        pedal_softsostenuto.read(&mut serial, &pin_sofsos);
     }
+}
+
+fn clamp(x: u16, min: u16, max: u16) -> u16 {
+    if x < min {
+        return min;
+    };
+    if x > max {
+        return max;
+    };
+    return x;
+}
+
+fn map_range(x: u16, in_min: u16, in_max: u16, out_min: u16, out_max: u16) -> u16 {
+    let a = x - in_min;
+    let b = a as u32 * out_max as u32;
+    let c = b / in_max as u32;
+
+    return (c + out_min as u32) as u16;
 }
 
 type Console = arduino_hal::hal::usart::Usart0<arduino_hal::DefaultClock>;
@@ -375,42 +467,40 @@ type Console = arduino_hal::hal::usart::Usart0<arduino_hal::DefaultClock>;
 fn calc_velocity(time: u32) -> u8 {
     let mut time = time;
 
-    if time > MAX_TIME_MS {
-        time = MAX_TIME_MS;
+    if time > KEY_MAX_TIME_MS {
+        time = KEY_MAX_TIME_MS;
     }
-    if time < MIN_TIME_MS {
-        time = MIN_TIME_MS;
+    if time < KEY_MIN_TIME_MS {
+        time = KEY_MIN_TIME_MS;
     }
 
-    time -= MIN_TIME_MS;
+    time -= KEY_MIN_TIME_MS;
 
-    let velocity = 127 - (time * 127 / MAX_TIME_MS_N);
+    let velocity = 127 - (time * 127 / KEY_MAX_TIME_MS_N);
 
     let velocity = (((velocity * velocity) >> 7) * velocity) >> 7;
     velocity as u8
 }
 
-fn send_midi(serial: &mut Console, event_type: MidiEvent, key_index: u8, velocity: u8) {
+fn send_midi(serial: &mut Console, event_type: MidiEvent, value_1: u8, value_2: u8) {
+    const CHANNEL: u8 = 0;
     match event_type {
         MidiEvent::On => {
-            if DEBUG {
-                ufmt::uwriteln!(serial, "MIDI: On K{} {}", key_index, velocity).unwrap();
-            } else {
-                serial.write_byte(0x90);
-                serial.write_byte(key_index);
-                serial.write_byte(velocity);
-            }
+            serial.write_byte(0x90 + CHANNEL);
         }
         MidiEvent::Off => {
-            if DEBUG {
-                ufmt::uwriteln!(serial, "MIDI: Off K{} {}", key_index, velocity).unwrap();
-            } else {
-                serial.write_byte(0x80);
-                serial.write_byte(key_index);
-                serial.write_byte(velocity);
-            }
+            serial.write_byte(0x80 + CHANNEL);
+        }
+        MidiEvent::PitchBend => {
+            serial.write_byte(0xE0 + CHANNEL);
+        }
+        MidiEvent::CC => {
+            serial.write_byte(0xB0 + CHANNEL);
         }
     }
+
+    serial.write_byte(value_1);
+    serial.write_byte(value_2);
 
     serial.flush();
 }
