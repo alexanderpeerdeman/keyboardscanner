@@ -7,13 +7,19 @@
 use core::cell;
 
 use arduino_hal::{
-    hal::port::{Dynamic, PF0},
+    hal::{
+        port::{Dynamic, PD2, PD3, PF0},
+        usart::BaudrateArduinoExt,
+    },
+    pac::USART1,
     port::{
         mode::{Analog, Input, Output, PullUp},
         Pin,
     },
-    Adc,
+    prelude::_unwrap_infallible_UnwrapInfallible,
+    Adc, Usart,
 };
+use embedded_hal::serial::Read;
 use panic_halt as _;
 
 const PRESCALER: u32 = 64;
@@ -97,7 +103,7 @@ impl Wheel {
 
 struct Key {
     index: u8,
-    name: &'static str,
+    // name: &'static str,
     state: KeyState,
     time: u32,
 
@@ -117,11 +123,11 @@ impl Key {
         fi: usize,
         si: usize,
         ki: usize,
-        name: &'static str,
+        _name: &'static str,
     ) -> Self {
         Self {
             index,
-            name,
+            // name,
             state: KeyState::Off,
             time: 0,
             kc,
@@ -260,6 +266,13 @@ fn main() -> ! {
     let mut adc = arduino_hal::Adc::new(dp.ADC, Default::default());
     let pins = arduino_hal::pins!(dp);
     let mut serial = arduino_hal::default_serial!(dp, pins, 115200);
+
+    let mut button_controller_serial = Usart::new(
+        dp.USART1,
+        pins.d19,
+        pins.d18.into_output(),
+        250000.into_baudrate(),
+    );
 
     millis_init(dp.TC0);
     // Enable interrupts globally
@@ -441,7 +454,112 @@ fn main() -> ! {
 
         pedal_damp.read(&mut serial, &pin_damp);
         pedal_softsostenuto.read(&mut serial, &pin_sofsos);
+
+        handle_buttons(&mut serial, &mut button_controller_serial);
     }
+}
+
+fn handle_buttons(
+    serial: &mut Console,
+    button_controller_serial: &mut Usart<USART1, Pin<Input, PD2>, Pin<Output, PD3>>,
+) {
+    match button_controller_serial.read() {
+        Ok(button_state) => {
+            let button_id = nb::block!(button_controller_serial.read()).unwrap_infallible();
+
+            // let button_name = match button_id {
+            //     0 => "Intro",
+            //     1 => "Accomp Chords",
+            //     2 => "Recorder",
+            //     3 => "Latin/World",
+            //     4 => "Modern",
+            //     5 => "Strings/Synth-Pad",
+            //     6 => "Tone",
+            //     7 => "Chorus",
+            //     8 => "Start/Stop",
+            //     9 => "Normal/Fill-In",
+            //     10 => "Pops/Jazz",
+            //     11 => "Metronome",
+            //     12 => "Organ",
+            //     13 => "Classic",
+            //     14 => "Reverb",
+            //     15 => "Function",
+            //     16 => "Variation/Fill-In",
+            //     17 => "Tempo +",
+            //     18 => "Rhythm",
+            //     19 => "User Rhythms",
+            //     20 => "Elec Piano",
+            //     21 => "Various/GM Tones",
+            //     22 => "No",
+            //     23 => "Card/Internal",
+            //     24 => "Tempo -",
+            //     25 => "Synchro/Ending",
+            //     26 => "Ballet/Piano Rhythms",
+            //     28 => "Bass/Guitar",
+            //     29 => "Vibes/Clavi",
+            //     30 => "Split",
+            //     31 => "Yes",
+            //     36 => "Store",
+            //     _ => "not used",
+            // };
+
+            let midi_controller_id = match button_id {
+                0 => 3,
+                1 => 9,
+                2 => 14,
+                3 => 15,
+                4 => 20,
+                5 => 21,
+                6 => 22,
+                7 => 23,
+                8 => 24,
+                9 => 25,
+                10 => 26,
+                11 => 27,
+                12 => 28,
+                13 => 29,
+                14 => 30,
+                15 => 31,
+                16 => 85,
+                17 => 86,
+                18 => 87,
+                19 => 88,
+                20 => 89,
+                21 => 90,
+                22 => 102,
+                23 => 103,
+                24 => 104,
+                25 => 105,
+                26 => 106,
+                28 => 107,
+                29 => 108,
+                30 => 109,
+                31 => 110,
+                36 => 111,
+                _ => {
+                    // unknown button was pressed, do nothing
+                    return;
+                }
+            };
+
+            if button_state == 129 {
+                // pressed!
+                // ufmt::uwriteln!(serial, "Pressed:  {}", button_name).unwrap_infallible();
+                send_midi(serial, MidiEvent::CC, midi_controller_id, 127)
+            }
+            if button_state == 128 {
+                // released!
+                // ufmt::uwriteln!(serial, "Released: {}", button_name).unwrap_infallible();
+                send_midi(serial, MidiEvent::CC, midi_controller_id, 0)
+            }
+        }
+        _ => {
+            // when there is nothing to read from the console, or something bad happend,
+            // do nothing
+            // ufmt::uwriteln!(serial, "Nothing").unwrap_infallible();
+            return;
+        }
+    };
 }
 
 fn clamp(x: u16, min: u16, max: u16) -> u16 {
