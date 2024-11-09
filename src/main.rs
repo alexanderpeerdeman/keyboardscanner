@@ -1,5 +1,3 @@
-// https://crates.io/crates/usbd-midi
-
 #![no_std]
 #![no_main]
 #![feature(abi_avr_interrupt)]
